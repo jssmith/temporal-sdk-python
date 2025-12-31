@@ -29,6 +29,7 @@ from tests.contrib.langgraph.e2e_graphs import (
     build_counter_graph,
     build_multi_interrupt_graph,
     build_native_react_agent_graph,
+    build_parallel_branches_graph,
     build_react_agent_graph,
     build_run_in_workflow_graph,
     build_sandbox_enforcement_graph,
@@ -37,6 +38,7 @@ from tests.contrib.langgraph.e2e_graphs import (
     build_store_graph,
     build_subgraph,
     build_subgraph_with_conditional,
+    reset_parallel_branches_barrier,
 )
 from tests.contrib.langgraph.e2e_workflows import (
     AgentSubgraphE2EWorkflow,
@@ -45,6 +47,7 @@ from tests.contrib.langgraph.e2e_workflows import (
     MultiInterruptE2EWorkflow,
     MultiInvokeStoreE2EWorkflow,
     NativeReactAgentE2EWorkflow,
+    ParallelBranchesE2EWorkflow,
     ReactAgentE2EWorkflow,
     RejectionE2EWorkflow,
     RunInWorkflowE2EWorkflow,
@@ -566,6 +569,44 @@ class TestAdvancedFeatures:
             assert result.get("path") == ["start", "middle", "finish"]
             # value=5 -> middle doubles to 10 -> finish adds 1000 = 1010
             assert result.get("result") == 1010
+
+    @pytest.mark.asyncio
+    async def test_parallel_branches_execute_concurrently(
+        self, client: Client
+    ) -> None:
+        """Test that parallel branches from START execute concurrently.
+
+        This test uses a threading.Barrier to verify parallel execution.
+        All 3 branch activities must reach the barrier together - if they
+        run sequentially, the barrier times out and raises BrokenBarrierError.
+        """
+        plugin = LangGraphPlugin(
+            graphs={"e2e_parallel_branches": build_parallel_branches_graph},
+            default_activity_timeout=timedelta(seconds=30),
+        )
+
+        new_config = client.config()
+        existing_plugins = new_config.get("plugins", [])
+        new_config["plugins"] = list(existing_plugins) + [plugin]
+        plugin_client = Client(**new_config)
+
+        # Reset the barrier before the test (3 branches, 5 second timeout)
+        reset_parallel_branches_barrier(num_branches=3, timeout=5.0)
+
+        async with new_worker(plugin_client, ParallelBranchesE2EWorkflow) as worker:
+            result = await plugin_client.execute_workflow(
+                ParallelBranchesE2EWorkflow.run,
+                id=f"e2e-parallel-branches-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+
+            # All 3 branches should have completed
+            assert sorted(result.get("results", [])) == [
+                "branch_a",
+                "branch_b",
+                "branch_c",
+            ]
 
 
 # ==============================================================================

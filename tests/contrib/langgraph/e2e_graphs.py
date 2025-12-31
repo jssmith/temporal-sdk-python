@@ -12,6 +12,7 @@ Naming conventions:
 from __future__ import annotations
 
 import operator
+import threading
 from datetime import timedelta
 from typing import Annotated, Any
 
@@ -916,3 +917,75 @@ def build_subgraph_with_conditional():
     parent.add_edge("low", END)
 
     return parent.compile()
+
+
+# ==============================================================================
+# Parallel Branches Graph (tests BSP parallel execution)
+# ==============================================================================
+
+# Threading barrier for parallel execution test.
+# All branch activities must reach this barrier - if sequential, timeout occurs.
+_parallel_branches_barrier: threading.Barrier | None = None
+
+
+def reset_parallel_branches_barrier(num_branches: int, timeout: float = 5.0) -> None:
+    """Reset the barrier before running the parallel branches test."""
+    global _parallel_branches_barrier
+    _parallel_branches_barrier = threading.Barrier(num_branches, timeout=timeout)
+
+
+class ParallelBranchesState(TypedDict, total=False):
+    """State for parallel branches test."""
+
+    results: Annotated[list[str], operator.add]
+
+
+def _parallel_branch_a(state: ParallelBranchesState) -> ParallelBranchesState:
+    """Branch A: waits at barrier for other branches."""
+    assert _parallel_branches_barrier is not None, "Barrier not initialized"
+    _parallel_branches_barrier.wait()  # Blocks until all branches arrive
+    return {"results": ["branch_a"]}
+
+
+def _parallel_branch_b(state: ParallelBranchesState) -> ParallelBranchesState:
+    """Branch B: waits at barrier for other branches."""
+    assert _parallel_branches_barrier is not None, "Barrier not initialized"
+    _parallel_branches_barrier.wait()
+    return {"results": ["branch_b"]}
+
+
+def _parallel_branch_c(state: ParallelBranchesState) -> ParallelBranchesState:
+    """Branch C: waits at barrier for other branches."""
+    assert _parallel_branches_barrier is not None, "Barrier not initialized"
+    _parallel_branches_barrier.wait()
+    return {"results": ["branch_c"]}
+
+
+def build_parallel_branches_graph():
+    """Build a graph with parallel branches from START.
+
+    Graph structure:
+        START -> branch_a -.
+        START -> branch_b --> END
+        START -> branch_c -'
+
+    All three branches should execute in parallel (same superstep).
+    Uses a threading.Barrier to verify parallel execution.
+    """
+    graph = StateGraph(ParallelBranchesState)
+
+    graph.add_node("branch_a", _parallel_branch_a)
+    graph.add_node("branch_b", _parallel_branch_b)
+    graph.add_node("branch_c", _parallel_branch_c)
+
+    # Parallel branches from START
+    graph.add_edge(START, "branch_a")
+    graph.add_edge(START, "branch_b")
+    graph.add_edge(START, "branch_c")
+
+    # All branches go directly to END
+    graph.add_edge("branch_a", END)
+    graph.add_edge("branch_b", END)
+    graph.add_edge("branch_c", END)
+
+    return graph.compile()

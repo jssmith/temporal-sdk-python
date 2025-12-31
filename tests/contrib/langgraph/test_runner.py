@@ -787,7 +787,7 @@ class TestParallelSendPacketExecution:
         true parallel execution via asyncio.gather.
         """
         import asyncio
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         from temporalio.contrib.langgraph._models import (
             ChannelWrite,

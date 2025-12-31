@@ -465,3 +465,18 @@ class SandboxEnforcementE2EWorkflow:
     async def run(self, input_value: int) -> dict:
         app = lg_compile("e2e_sandbox_enforcement")
         return await app.ainvoke({"value": input_value})
+
+
+@workflow.defn
+class ParallelBranchesE2EWorkflow:
+    """Workflow that tests parallel branch execution (BSP model).
+
+    This tests that multiple branches from the same node execute in parallel,
+    not sequentially. Uses a threading.Barrier in the activities - if they
+    run sequentially, the barrier times out and the test fails.
+    """
+
+    @workflow.run
+    async def run(self) -> dict:
+        app = lg_compile("e2e_parallel_branches")
+        return await app.ainvoke({})
