@@ -891,3 +891,103 @@ class TestParallelSendPacketExecution:
         writes = await runner._execute_send_packets([], config)
 
         assert writes == []
+
+    @pytest.mark.asyncio
+    async def test_loop_tasks_execute_in_parallel(self) -> None:
+        """Loop tasks should execute in parallel, not sequentially.
+
+        This test verifies that _execute_loop_tasks executes multiple
+        independent tasks from a single tick in parallel using asyncio.gather,
+        following LangGraph's BSP (Bulk Synchronous Parallel) model.
+        """
+        import asyncio
+        import threading
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from temporalio.contrib.langgraph._runner import TemporalLangGraphRunner
+
+        # Coordination primitives for detecting parallel execution
+        num_tasks = 3
+        active_tasks_lock = threading.Lock()
+        active_tasks_count = 0
+        max_concurrent_tasks = 0
+        all_tasks_started = asyncio.Event()
+
+        # Track execution order
+        execution_order = []
+
+        async def mock_execute_task(task, loop):
+            """Mock task execution that tracks concurrency."""
+            nonlocal active_tasks_count, max_concurrent_tasks
+
+            task_name = task.name
+
+            # Atomically increment active tasks counter
+            with active_tasks_lock:
+                active_tasks_count += 1
+                execution_order.append(("start", task_name))
+                current_count = active_tasks_count
+                max_concurrent_tasks = max(max_concurrent_tasks, current_count)
+
+                # If all tasks have started concurrently, signal
+                if active_tasks_count == num_tasks:
+                    all_tasks_started.set()
+
+            # Do some async work
+            await asyncio.sleep(0.05)
+
+            # For parallel execution: wait for all tasks to start
+            # For sequential execution: this will timeout (only 1 task active at a time)
+            try:
+                await asyncio.wait_for(all_tasks_started.wait(), timeout=0.2)
+            except asyncio.TimeoutError:
+                pass  # Sequential execution - won't reach num_tasks concurrently
+
+            # Atomically decrement active tasks counter
+            with active_tasks_lock:
+                active_tasks_count -= 1
+                execution_order.append(("end", task_name))
+
+            return True  # Task succeeded (not interrupted)
+
+        # Create mock tasks
+        mock_tasks = []
+        for i in range(num_tasks):
+            task = MagicMock()
+            task.name = f"node-{i+1}"
+            task.id = f"task-{i+1}"
+            mock_tasks.append(task)
+
+        # Create runner
+        mock_pregel = MagicMock()
+        mock_pregel.step_timeout = None
+        mock_pregel.nodes = {}
+        runner = TemporalLangGraphRunner(mock_pregel, graph_id="test_parallel_loop")
+
+        # Mock loop
+        mock_loop = MagicMock()
+
+        # Replace _execute_task with our mock
+        with patch.object(runner, "_execute_task", side_effect=mock_execute_task):
+            result = await runner._execute_loop_tasks(mock_tasks, mock_loop)
+
+        # Verify no interruption
+        assert result == False, "No task should have been interrupted"
+
+        # Check execution order
+        starts = [e for e in execution_order if e[0] == "start"]
+        ends = [e for e in execution_order if e[0] == "end"]
+        assert len(starts) == num_tasks, f"Expected {num_tasks} starts, got {len(starts)}"
+        assert len(ends) == num_tasks, f"Expected {num_tasks} ends, got {len(ends)}"
+
+        # The key assertion: for parallel execution, max_concurrent_tasks should equal num_tasks
+        # For sequential execution, max_concurrent_tasks will be 1
+        assert max_concurrent_tasks == num_tasks, (
+            f"Tasks did not execute in parallel. "
+            f"Max concurrent tasks: {max_concurrent_tasks}, expected: {num_tasks}"
+        )
+
+        # Additional check: all_tasks_started should be set for parallel execution
+        assert all_tasks_started.is_set(), (
+            "Not all tasks started concurrently - executing sequentially"
+        )
