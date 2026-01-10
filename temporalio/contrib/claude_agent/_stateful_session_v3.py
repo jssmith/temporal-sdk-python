@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from asyncio import CancelledError
 from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
@@ -18,6 +20,12 @@ from temporalio.workflow import ActivityConfig, ActivityHandle
 from ._session_config import ClaudeSessionConfig
 
 logger = logging.getLogger(__name__)
+
+
+class ClaudeSessionHeartbeatDetails(BaseModel):
+    """Heartbeat details for session recovery."""
+
+    session_id: str | None = None  # Claude session ID for resumption
 
 
 class ClaudeSessionArgs(BaseModel):
@@ -126,11 +134,18 @@ class StatefulClaudeSessionProvider:
         @activity.defn(name=self._name)
         async def session_activity(args: ClaudeSessionArgs) -> None:
             """Activity that manages a stateful Claude session with multi-turn support."""
+            # Track current session_id for heartbeat details
+            current_session_id: str | None = None
+
+            def get_heartbeat_details() -> ClaudeSessionHeartbeatDetails:
+                """Get current heartbeat details."""
+                return ClaudeSessionHeartbeatDetails(session_id=current_session_id)
+
             async def heartbeat_every(delay: float):
-                """Send heartbeat regularly."""
+                """Send heartbeat regularly with session details."""
                 while True:
                     await asyncio.sleep(delay)
-                    activity.heartbeat()
+                    activity.heartbeat(get_heartbeat_details().model_dump())
 
             heartbeat_task = asyncio.create_task(heartbeat_every(30))
 
@@ -144,6 +159,22 @@ class StatefulClaudeSessionProvider:
             try:
                 logger.info(f"Starting Claude session for workflow: {args.caller_workflow_id}")
 
+                # Check if we're recovering from a previous attempt
+                activity_info = activity.info()
+                previous_session_id: str | None = None
+
+                if activity_info.heartbeat_details:
+                    try:
+                        # Parse heartbeat details to recover session_id
+                        details = ClaudeSessionHeartbeatDetails.model_validate(
+                            activity_info.heartbeat_details[0]
+                        )
+                        previous_session_id = details.session_id
+                        if previous_session_id:
+                            logger.info(f"Recovering session from heartbeat: {previous_session_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to parse heartbeat details: {e}")
+
                 # Get handle to calling workflow
                 temporal_client = activity.client()
                 workflow_handle = temporal_client.get_workflow_handle(
@@ -151,8 +182,88 @@ class StatefulClaudeSessionProvider:
                     run_id=args.caller_run_id
                 )
 
+                # Set up session directory for persistence
+                config = args.config
+                if not config.session_dir:
+                    # Create a consistent session directory based on workflow_id
+                    base_dir = os.path.join(tempfile.gettempdir(), "temporal-claude-sessions")
+                    os.makedirs(base_dir, exist_ok=True)
+                    # Use workflow_id to create consistent directory
+                    safe_workflow_id = args.caller_workflow_id.replace("/", "_").replace(":", "_")
+                    session_dir = os.path.join(base_dir, safe_workflow_id)
+                    os.makedirs(session_dir, exist_ok=True)
+                    config = config.model_copy(update={"cwd": session_dir})
+                    logger.info(f"Using session directory: {session_dir}")
+
+                # If we have a previous session_id and auto_resume is enabled, resume it
+                if previous_session_id and config.auto_resume and not config.resume:
+                    config = config.model_copy(update={
+                        "resume": previous_session_id,
+                        "continue_conversation": True,
+                    })
+                    logger.info(f"Resuming previous session: {previous_session_id}")
+
                 # Convert config to options
-                options = args.config.to_claude_options()
+                options = config.to_claude_options()
+
+                # Query workflow for registered tools
+                registered_tools: list[str] = []
+                try:
+                    registered_tools = await workflow_handle.query("get_registered_tools")
+                    if registered_tools:
+                        logger.info(f"Workflow has registered tool handlers: {registered_tools}")
+                except Exception as e:
+                    logger.debug(f"Could not query registered tools: {e}")
+
+                # Create tool interception callback if there are registered tools
+                if registered_tools:
+                    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+                    async def can_use_tool(
+                        tool_name: str,
+                        input_data: dict,
+                        context: Any,
+                    ):
+                        """Intercept tool calls for registered handlers."""
+                        if tool_name not in registered_tools:
+                            # Not a registered tool, let Claude handle it
+                            return PermissionResultAllow()
+
+                        logger.info(f"Intercepting tool: {tool_name}")
+
+                        # Generate a unique tool ID
+                        import uuid
+                        tool_id = str(uuid.uuid4())
+
+                        # Signal the workflow to execute the tool
+                        await workflow_handle.signal(
+                            "request_tool_execution",
+                            {
+                                "tool_id": tool_id,
+                                "tool_name": tool_name,
+                                "input": input_data,
+                            }
+                        )
+
+                        # Wait for the result via update
+                        result = await workflow_handle.execute_update(
+                            "get_tool_result",
+                            tool_id
+                        )
+
+                        if result.get("success"):
+                            # Return the result as if the tool executed
+                            # We need to tell Claude the tool succeeded with our result
+                            return PermissionResultAllow(updated_input=input_data)
+                        else:
+                            # Tool execution failed or was denied
+                            return PermissionResultDeny(
+                                message=result.get("error", "Tool execution failed"),
+                                interrupt=result.get("interrupt", False)
+                            )
+
+                    # Set the callback on options
+                    options.can_use_tool = can_use_tool
 
                 # Create and connect Claude SDK client
                 logger.info("Creating ClaudeSDKClient")
@@ -163,6 +274,8 @@ class StatefulClaudeSessionProvider:
 
                 # Start background task to read responses
                 async def read_responses():
+                    nonlocal current_session_id  # Allow updating session_id for heartbeats
+
                     try:
                         logger.info("Starting to read responses from Claude")
                         async for message in client.receive_messages():
@@ -175,10 +288,17 @@ class StatefulClaudeSessionProvider:
                             logger.debug(f"Received from Claude: {msg_type}")
 
                             if msg_type == "SystemMessage":
+                                data = message.data if hasattr(message, "data") else {}
                                 response = {
                                     "type": "system",
-                                    "data": message.data if hasattr(message, "data") else {}
+                                    "data": data
                                 }
+                                # Extract session_id from system message if present
+                                if isinstance(data, dict) and "session_id" in data:
+                                    current_session_id = data["session_id"]
+                                    logger.info(f"Captured session_id: {current_session_id}")
+                                    # Send immediate heartbeat with new session_id
+                                    activity.heartbeat(get_heartbeat_details().model_dump())
                             elif msg_type == "AssistantMessage":
                                 # Extract text from content blocks
                                 text = ""
@@ -237,8 +357,8 @@ class StatefulClaudeSessionProvider:
                 session_active = True
                 try:
                     while session_active:
-                        # Poll workflow for outgoing messages
-                        outgoing = await workflow_handle.query("get_outgoing_claude_messages")
+                        # Get outgoing messages via update (updates can mutate state)
+                        outgoing = await workflow_handle.execute_update("get_and_consume_messages")
 
                         if not outgoing:
                             # No messages yet, wait briefly

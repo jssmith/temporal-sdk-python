@@ -45,7 +45,12 @@ from temporalio.contrib.claude_agent._simple_client import SimplifiedClaudeClien
 from temporalio.contrib.claude_agent._stateful_session_v3 import (
     StatefulClaudeSessionProvider,
 )
-from temporalio.contrib.claude_agent._workflow_helpers import ClaudeMessageReceiver
+from temporalio.contrib.claude_agent._tool_decorator import ToolDenied, claude_tool
+from temporalio.contrib.claude_agent._workflow_helpers import (
+    ClaudeMessageReceiver,
+    ToolRequest,
+    ToolResult,
+)
 from temporalio.contrib.pydantic import (
     PydanticPayloadConverter,
     ToJsonOptions,
@@ -67,6 +72,10 @@ __all__ = [
     "ManagedClaudeSession",
     "SimplifiedClaudeClient",
     "StatefulClaudeSessionProvider",
+    "ToolDenied",
+    "ToolRequest",
+    "ToolResult",
+    "claude_tool",
     "workflow",
 ]
 
@@ -186,7 +195,10 @@ class ClaudeAgentPlugin(SimplePlugin):
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(
-                        "claude_agent_sdk", "anyio", "sniffio"
+                        "claude_agent_sdk",
+                        "anyio",
+                        "sniffio",
+                        "pydantic_core",  # Required for Pydantic BaseModel in workflows
                     ),
                 )
             return runner

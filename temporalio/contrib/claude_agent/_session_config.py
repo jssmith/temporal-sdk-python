@@ -32,9 +32,13 @@ class ClaudeSessionConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     add_dirs: list[str] = Field(default_factory=list)
 
+    # Session recovery options
+    session_dir: str | None = None  # Base directory for session state (default: temp dir)
+    auto_resume: bool = True  # Automatically resume existing session if found
+
     # Session control
     continue_conversation: bool = False
-    resume: str | None = None
+    resume: str | None = None  # Explicit session ID to resume
     fork_session: bool = False
 
     # Settings
@@ -64,6 +68,11 @@ class ClaudeSessionConfig(BaseModel):
 
         # Convert to dict, excluding unset fields
         config_dict = self.model_dump(exclude_unset=True)
+
+        # Remove Temporal-specific fields that aren't part of ClaudeAgentOptions
+        temporal_only_fields = {"session_dir", "auto_resume"}
+        for field in temporal_only_fields:
+            config_dict.pop(field, None)
 
         # Create ClaudeAgentOptions with our values
         return ClaudeAgentOptions(**config_dict)
